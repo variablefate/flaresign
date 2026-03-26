@@ -30,7 +30,11 @@ final class AppState {
 
     // MARK: - Setup
 
+    private var isSetUp = false
+
     func setup(modelContext: ModelContext) {
+        guard !isSetUp else { return }
+        isSetUp = true
         identityManager = IdentityManager(modelContext: modelContext, passkeyManager: passkeyManager)
         loadIdentities()
 

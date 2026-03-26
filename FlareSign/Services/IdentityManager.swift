@@ -106,8 +106,9 @@ final class IdentityManager {
         index: Int,
         isPasskeyDerived: Bool
     ) throws -> Identity {
-        // Store private key in Keychain
-        try KeychainStore.save(privateKeyHex: keypair.exportNsec(), for: keypair.publicKeyHex)
+        // Store raw hex private key in Keychain (SecretKey.parse expects hex, not nsec)
+        let privateKeyHex = try NostrPasskey.NIP19.nsecDecode(keypair.exportNsec())
+        try KeychainStore.save(privateKeyHex: privateKeyHex, for: keypair.publicKeyHex)
 
         // Store public metadata in SwiftData
         let identity = Identity(

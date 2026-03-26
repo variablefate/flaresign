@@ -22,7 +22,9 @@ enum NIP46URIParser {
         let components = URLComponents(string: normalized)
         let queryItems = components?.queryItems ?? []
 
-        let relays = queryItems.filter { $0.name == "relay" }.compactMap(\.value)
+        let relays = queryItems.filter { $0.name == "relay" }
+            .compactMap(\.value)
+            .filter { $0.hasPrefix("wss://") || $0.hasPrefix("ws://") }
         let secret = queryItems.first(where: { $0.name == "secret" })?.value
         let name = queryItems.first(where: { $0.name == "name" })?.value
         let appURL = queryItems.first(where: { $0.name == "url" })?.value
@@ -59,7 +61,9 @@ enum NIP46URIParser {
         let components = URLComponents(string: normalized)
         let queryItems = components?.queryItems ?? []
 
-        let relays = queryItems.filter { $0.name == "relay" }.compactMap(\.value)
+        let relays = queryItems.filter { $0.name == "relay" }
+            .compactMap(\.value)
+            .filter { $0.hasPrefix("wss://") || $0.hasPrefix("ws://") }
         let secret = queryItems.first(where: { $0.name == "secret" })?.value
 
         guard !relays.isEmpty else { return nil }

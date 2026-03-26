@@ -34,5 +34,11 @@ struct MainTabView: View {
         .task {
             await appState.startNIP46Service()
         }
+        .sheet(isPresented: Binding(
+            get: { appState.requestQueue.currentRequest != nil },
+            set: { if !$0 { appState.requestQueue.deny() } }
+        )) {
+            ApproveRequestSheet()
+        }
     }
 }

@@ -34,7 +34,11 @@ actor NIP46Service {
         }
 
         do {
-            let signer = NostrSigner.keys(keys: identityKeys.values.first!)
+            guard let firstKeys = identityKeys.values.first else {
+                logger.warning("No valid identity keys after parsing")
+                return
+            }
+            let signer = NostrSigner.keys(keys: firstKeys)
             client = Client(signer: signer)
 
             for relay in defaultRelays {
