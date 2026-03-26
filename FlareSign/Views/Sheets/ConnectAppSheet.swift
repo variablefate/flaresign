@@ -125,6 +125,34 @@ struct ConnectAppSheet: View {
                 .onAppear {
                     selectedIdentity = appState.selectedIdentity ?? appState.identities.first
                 }
+                .fullScreenCover(isPresented: $showScanner) {
+                    ZStack {
+                        Color.rfSurface.ignoresSafeArea()
+                        VStack(spacing: 0) {
+                            HStack {
+                                Button("Cancel") { showScanner = false }
+                                    .font(RFFont.title(16))
+                                    .foregroundColor(Color.rfPrimary)
+                                Spacer()
+                                Text("Scan QR Code")
+                                    .font(RFFont.title(16))
+                                    .foregroundColor(Color.rfOnSurface)
+                                Spacer()
+                                // Balance the cancel button
+                                Text("Cancel").opacity(0)
+                                    .font(RFFont.title(16))
+                            }
+                            .padding(.horizontal, 16)
+                            .padding(.vertical, 12)
+
+                            QRScannerView { scannedCode in
+                                showScanner = false
+                                pasteText = scannedCode
+                                parseURI(scannedCode)
+                            }
+                        }
+                    }
+                }
             }
         }
     }
