@@ -5,13 +5,12 @@ import os
 /// Core NIP-46 relay service.
 ///
 /// Connects to relays, subscribes for Kind 24133 events tagged to any active identity,
-/// decrypts incoming requests, routes them through the permission engine, and
-/// publishes encrypted responses.
+/// decrypts incoming requests, routes them through sessions.
 actor NIP46Service {
     private let logger = Logger(subsystem: "com.flaresign", category: "NIP46")
     private var client: Client?
     private var sessions: [String: NIP46Session] = [:]  // keyed by client pubkey
-    private var identityKeys: [String: Keys] = []        // pubkey hex → rust-nostr Keys
+    private var identityKeys: [String: Keys] = [:]       // pubkey hex → rust-nostr Keys
 
     private let defaultRelays = [
         "wss://relay.damus.io",
@@ -19,48 +18,35 @@ actor NIP46Service {
         "wss://relay.primal.net",
     ]
 
-    /// Start the NIP-46 service: connect to relays, subscribe for requests.
+    // MARK: - Lifecycle
+
     func start(identities: [(publicKeyHex: String, privateKeyHex: String)]) async {
-        // Store identity keys for decryption
         for identity in identities {
             if let secretKey = try? SecretKey.parse(secretKey: identity.privateKeyHex) {
                 identityKeys[identity.publicKeyHex] = Keys(secretKey: secretKey)
             }
         }
 
-        guard !identityKeys.isEmpty else {
+        guard let firstKeys = identityKeys.values.first else {
             logger.warning("No valid identity keys — NIP-46 service not starting")
             return
         }
 
         do {
-            guard let firstKeys = identityKeys.values.first else {
-                logger.warning("No valid identity keys after parsing")
-                return
-            }
             let signer = NostrSigner.keys(keys: firstKeys)
             client = Client(signer: signer)
 
             for relay in defaultRelays {
-                try await client?.addRelay(url: relay)
+                let relayUrl = try RelayUrl.parse(url: relay)
+                try await client?.addRelay(url: relayUrl)
             }
             try await client?.connect()
-
-            // Subscribe for Kind 24133 events p-tagged to any of our identities
-            let pubkeys = identityKeys.keys.map { $0 }
-            let filter = Filter()
-                .kinds(kinds: [24133])
-                .pubkeys(publicKeys: pubkeys.compactMap { try? PublicKey.parse(publicKey: $0) })
-
-            // Note: actual subscription handling depends on rust-nostr streaming API
-            // This is the subscription setup — event handling is in handleIncomingEvents()
-            logger.info("NIP-46 service started with \(pubkeys.count) identities")
+            logger.info("NIP-46 service started with \(self.identityKeys.count) identities")
         } catch {
             logger.error("Failed to start NIP-46 service: \(error)")
         }
     }
 
-    /// Stop the service and disconnect.
     func stop() async {
         try? await client?.disconnect()
         client = nil
@@ -69,26 +55,28 @@ actor NIP46Service {
         logger.info("NIP-46 service stopped")
     }
 
-    /// Register a session for a connected app.
+    // MARK: - Session Management
+
     func addSession(_ session: NIP46Session) {
         sessions[session.clientPubkey] = session
         logger.info("Session added for client: \(session.clientPubkey.prefix(8))...")
     }
 
-    /// Remove a session (disconnect app).
     func removeSession(clientPubkey: String) {
         sessions.removeValue(forKey: clientPubkey)
         logger.info("Session removed for client: \(clientPubkey.prefix(8))...")
     }
 
-    /// Add relays for a specific app session.
     func addRelays(_ relays: [String]) async {
         for relay in relays {
-            try? await client?.addRelay(url: relay)
+            if let relayUrl = try? RelayUrl.parse(url: relay) {
+                try? await client?.addRelay(url: relayUrl)
+            }
         }
     }
 
-    /// Publish an encrypted NIP-46 response.
+    // MARK: - Publish Response
+
     func publishResponse(
         _ response: NIP46Response,
         to clientPubkey: String,
@@ -107,23 +95,25 @@ actor NIP46Service {
             let encrypted = try nip44Encrypt(
                 secretKey: keys.secretKey(),
                 publicKey: recipientPubkey,
-                content: plaintext
+                content: plaintext,
+                version: .v2
             )
 
-            let event = try EventBuilder(
-                kind: 24133,
-                content: encrypted,
-                tags: [.publicKey(publicKey: recipientPubkey)]
-            ).signWith(keys: keys)
+            let tag = try Tag.parse(data: ["p", clientPubkey])
+            let builder = EventBuilder(kind: Kind(kind: 24133), content: encrypted)
+                .tags(tags: [tag])
 
-            let eventId = try await client?.sendEvent(event: event)
-            logger.info("Published NIP-46 response \(response.id) → \(eventId?.toHex().prefix(8) ?? "nil")...")
+            let signer = NostrSigner.keys(keys: keys)
+            let event = try await builder.sign(signer: signer)
+            let output = try await client?.sendEvent(event: event)
+            logger.info("Published NIP-46 response \(response.id)")
         } catch {
             logger.error("Failed to publish NIP-46 response: \(error)")
         }
     }
 
-    /// Decrypt an incoming Kind 24133 event content.
+    // MARK: - Decrypt
+
     func decryptRequest(
         content: String,
         senderPubkey: String,
@@ -145,23 +135,46 @@ actor NIP46Service {
         }
     }
 
-    /// Sign an event using an identity's private key.
+    // MARK: - Sign Event
+
     func signEvent(
         unsignedEventJSON: String,
         identityPubkey: String
-    ) -> String? {
+    ) async -> String? {
         guard let keys = identityKeys[identityPubkey] else { return nil }
 
         do {
-            let event = try EventBuilder.fromJson(json: unsignedEventJSON).signWith(keys: keys)
-            return try event.asJson()
+            // Parse the unsigned event JSON to extract kind, content, tags
+            guard let data = unsignedEventJSON.data(using: .utf8),
+                  let dict = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let kindNum = dict["kind"] as? Int,
+                  let content = dict["content"] as? String else {
+                logger.error("Failed to parse unsigned event JSON")
+                return nil
+            }
+
+            let tagArrays = dict["tags"] as? [[String]] ?? []
+            var tags: [Tag] = []
+            for tagArray in tagArrays {
+                if let tag = try? Tag.parse(data: tagArray) {
+                    tags.append(tag)
+                }
+            }
+
+            let builder = EventBuilder(kind: Kind(kind: UInt16(kindNum)), content: content)
+                .tags(tags: tags)
+
+            let signer = NostrSigner.keys(keys: keys)
+            let signedEvent = try await builder.sign(signer: signer)
+            return try signedEvent.asJson()
         } catch {
             logger.error("Failed to sign event: \(error)")
             return nil
         }
     }
 
-    /// NIP-44 encrypt using an identity's key.
+    // MARK: - NIP-44 Encrypt/Decrypt
+
     func nip44EncryptContent(
         plaintext: String,
         recipientPubkey: String,
@@ -170,14 +183,13 @@ actor NIP46Service {
         guard let keys = identityKeys[identityPubkey] else { return nil }
         do {
             let recipientPK = try PublicKey.parse(publicKey: recipientPubkey)
-            return try nip44Encrypt(secretKey: keys.secretKey(), publicKey: recipientPK, content: plaintext)
+            return try nip44Encrypt(secretKey: keys.secretKey(), publicKey: recipientPK, content: plaintext, version: .v2)
         } catch {
             logger.error("Failed to NIP-44 encrypt: \(error)")
             return nil
         }
     }
 
-    /// NIP-44 decrypt using an identity's key.
     func nip44DecryptContent(
         ciphertext: String,
         senderPubkey: String,
