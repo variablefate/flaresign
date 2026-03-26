@@ -7,6 +7,8 @@ struct ConnectAppSheet: View {
     @State private var parsedParams: NostrConnectParams?
     @State private var errorMessage: String?
     @State private var showScanner = false
+    @State private var selectedIdentity: Identity?
+    @State private var isConnecting = false
 
     var body: some View {
         ZStack {
@@ -76,10 +78,29 @@ struct ConnectAppSheet: View {
                             }
                             .rfCard(.low)
 
-                            Button("Approve Connection") {
+                            // Identity picker (only if multiple identities)
+                            if appState.identities.count > 1 {
+                                SectionLabel("Sign as")
+                                Picker("Identity", selection: $selectedIdentity) {
+                                    ForEach(appState.identities, id: \.publicKeyHex) { identity in
+                                        Text(identity.label).tag(Optional(identity))
+                                    }
+                                }
+                                .pickerStyle(.menu)
+                                .tint(Color.rfPrimary)
+                            }
+
+                            Button {
                                 approveConnection(params)
+                            } label: {
+                                if isConnecting {
+                                    ProgressView().tint(.black)
+                                } else {
+                                    Text("Approve Connection")
+                                }
                             }
                             .buttonStyle(RFPrimaryButtonStyle())
+                            .disabled(isConnecting)
                         }
                     }
 
@@ -101,6 +122,9 @@ struct ConnectAppSheet: View {
                             .foregroundColor(Color.rfOnSurfaceVariant)
                     }
                 }
+                .onAppear {
+                    selectedIdentity = appState.selectedIdentity ?? appState.identities.first
+                }
             }
         }
     }
@@ -120,7 +144,14 @@ struct ConnectAppSheet: View {
     }
 
     private func approveConnection(_ params: NostrConnectParams) {
-        // TODO: Create ConnectedApp, add session to NIP46Service, send connect response
-        dismiss()
+        guard !isConnecting else { return }
+        let identity = selectedIdentity ?? appState.selectedIdentity ?? appState.identities.first
+        guard let identity else { return }
+        isConnecting = true
+        Task {
+            await appState.approveConnection(params, forIdentity: identity)
+            isConnecting = false
+            dismiss()
+        }
     }
 }
