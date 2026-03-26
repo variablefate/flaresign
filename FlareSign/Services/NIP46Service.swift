@@ -11,6 +11,17 @@ actor NIP46Service {
     private var client: Client?
     private var sessions: [String: NIP46Session] = [:]  // keyed by client pubkey
     private var identityKeys: [String: Keys] = [:]       // pubkey hex → rust-nostr Keys
+    private var notificationHandler: NIP46NotificationHandler?
+    private var notificationTask: Task<Void, Never>?
+
+    /// Callback invoked when an incoming request needs processing.
+    /// Parameters: (senderPubkey, recipientIdentityPubkey, NIP46Request)
+    private var onIncomingRequest: ((String, String, NIP46Request) -> Void)?
+
+    /// Set the callback for incoming requests (must be called from outside the actor).
+    func setOnIncomingRequest(_ handler: @escaping (String, String, NIP46Request) -> Void) {
+        onIncomingRequest = handler
+    }
 
     private let defaultRelays = [
         "wss://relay.damus.io",
@@ -40,7 +51,21 @@ actor NIP46Service {
                 let relayUrl = try RelayUrl.parse(url: relay)
                 try await client?.addRelay(url: relayUrl)
             }
-            try await client?.connect()
+            await client?.connect()
+
+            // Start notification handler for streaming events
+            if let client {
+                startNotificationHandler(client: client)
+            }
+
+            // Subscribe for Kind 24133 events p-tagged to any of our identities
+            let filter = Filter()
+                .kind(kind: Kind(kind: 24133))
+                .since(timestamp: Timestamp.now())
+            if let client {
+                let _ = try await client.subscribe(filter: filter)
+            }
+
             logger.info("NIP-46 service started with \(self.identityKeys.count) identities")
         } catch {
             logger.error("Failed to start NIP-46 service: \(error)")
@@ -203,5 +228,87 @@ actor NIP46Service {
             logger.error("Failed to NIP-44 decrypt: \(error)")
             return nil
         }
+    }
+
+    // MARK: - Notification Handler
+
+    private func startNotificationHandler(client: Client) {
+        let handler = NIP46NotificationHandler()
+        self.notificationHandler = handler
+
+        // Wire the handler to route events back to this actor
+        handler.onEvent = { [weak self] event in
+            guard let self else { return }
+            Task {
+                await self.handleIncomingEvent(event)
+            }
+        }
+
+        notificationTask = Task.detached { [handler] in
+            do {
+                try await client.handleNotifications(handler: handler)
+            } catch {
+                // handleNotifications exited — relay disconnected
+            }
+        }
+    }
+
+    /// Process an incoming Kind 24133 event.
+    private func handleIncomingEvent(_ event: EventData) {
+        let senderPubkey = event.pubkey
+        let content = event.content
+
+        // Find which identity this event is addressed to (check p-tags)
+        let recipientPubkey = event.pTags.first ?? identityKeys.keys.first
+        guard let recipientPubkey, identityKeys[recipientPubkey] != nil else {
+            // Try all identities
+            for pubkey in identityKeys.keys {
+                if let request = decryptRequest(content: content, senderPubkey: senderPubkey, recipientIdentityPubkey: pubkey) {
+                    onIncomingRequest?(senderPubkey, pubkey, request)
+                    return
+                }
+            }
+            return
+        }
+
+        if let request = decryptRequest(content: content, senderPubkey: senderPubkey, recipientIdentityPubkey: recipientPubkey) {
+            onIncomingRequest?(senderPubkey, recipientPubkey, request)
+        }
+    }
+}
+
+// MARK: - Event Data (lightweight struct for passing from handler)
+
+struct EventData: Sendable {
+    let pubkey: String
+    let content: String
+    let pTags: [String]
+}
+
+// MARK: - Notification Handler
+
+/// Routes incoming relay events to the NIP46Service actor.
+final class NIP46NotificationHandler: HandleNotification, @unchecked Sendable {
+    var onEvent: ((EventData) -> Void)?
+
+    func handleMsg(relayUrl: RelayUrl, msg: RelayMessage) async {}
+
+    func handle(relayUrl: RelayUrl, subscriptionId: String, event: Event) async {
+        // Extract data from rust-nostr Event into our Sendable struct
+        let pubkey = event.author().toHex()
+        let content = event.content()
+
+        // Extract p-tags
+        var pTags: [String] = []
+        if let tags = try? event.tags().toVec() {
+            for tag in tags {
+                if let vec = try? tag.asVec(), vec.count >= 2, vec[0] == "p" {
+                    pTags.append(vec[1])
+                }
+            }
+        }
+
+        let eventData = EventData(pubkey: pubkey, content: content, pTags: pTags)
+        onEvent?(eventData)
     }
 }

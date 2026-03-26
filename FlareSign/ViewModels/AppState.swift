@@ -174,34 +174,105 @@ final class AppState {
             await nip46Service.addSession(session)
         }
 
-        // Start polling for incoming requests
-        startEventPolling()
+        // Wire incoming request handler
+        await nip46Service.setOnIncomingRequest { [weak self] senderPubkey, identityPubkey, request in
+            guard let self else { return }
+            Task { @MainActor in
+                self.handleIncomingNIP46Request(senderPubkey: senderPubkey, identityPubkey: identityPubkey, request: request)
+            }
+        }
     }
 
     func stopNIP46Service() async {
         await nip46Service.stop()
     }
 
-    // MARK: - Event Polling
+    // MARK: - Incoming Request Handling
 
-    /// Poll relays for incoming Kind 24133 events.
-    /// rust-nostr Swift doesn't expose streaming — use fetchEvents with since parameter.
-    private func startEventPolling() {
-        Task {
-            var lastSeen = UInt64(Date.now.timeIntervalSince1970)
-            while authState == .ready {
-                try? await Task.sleep(for: .seconds(3))
-                guard authState == .ready else { break }
-
-                await pollForRequests(since: lastSeen)
-                lastSeen = UInt64(Date.now.timeIntervalSince1970)
-            }
+    /// Called when the NIP-46 service receives a decrypted request from a relay.
+    private func handleIncomingNIP46Request(senderPubkey: String, identityPubkey: String, request: NIP46Request) {
+        // Find the session for this sender
+        guard let app = connectedApps.first(where: { $0.clientPubkey == senderPubkey }) else {
+            logger.info("Ignoring request from unknown client: \(senderPubkey.prefix(8))...")
+            return
         }
-    }
 
-    private func pollForRequests(since: UInt64) async {
-        // This will be implemented once we verify the rust-nostr fetchEvents API
-        // For now, the request flow works via manual testing with mock requests
+        // Extract event kind if sign_event
+        let kind: Int? = {
+            guard request.method == "sign_event", let json = request.params.first,
+                  let data = json.data(using: .utf8),
+                  let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+            return dict["kind"] as? Int
+        }()
+
+        // Check permissions
+        let decision = PermissionEngine.evaluate(method: request.method, kind: kind, permissions: app.permissions)
+
+        switch decision {
+        case .allow:
+            // Auto-approve: execute and respond immediately
+            Task {
+                let session = NIP46Session(
+                    clientPubkey: senderPubkey,
+                    identityPubkey: identityPubkey,
+                    appId: app.id,
+                    appName: app.name
+                )
+                let response = await session.executeRequest(request, nip46Service: nip46Service)
+                await nip46Service.publishResponse(response, to: senderPubkey, signingWith: identityPubkey)
+
+                // Log
+                if let ctx = modelContext {
+                    let entry = ActivityLogEntry(
+                        appName: app.name, appId: app.id,
+                        method: request.method, kind: kind, approved: true,
+                        eventPreview: request.params.first.map { String($0.prefix(200)) }
+                    )
+                    ctx.insert(entry)
+                    try? ctx.save()
+                }
+                app.lastUsedAt = .now
+                try? modelContext?.save()
+            }
+
+        case .deny:
+            // Auto-deny: respond with error
+            Task {
+                let response = NIP46Response.error(id: request.id, message: "Denied by policy")
+                await nip46Service.publishResponse(response, to: senderPubkey, signingWith: identityPubkey)
+
+                if let ctx = modelContext {
+                    let entry = ActivityLogEntry(
+                        appName: app.name, appId: app.id,
+                        method: request.method, kind: kind, approved: false
+                    )
+                    ctx.insert(entry)
+                    try? ctx.save()
+                }
+            }
+
+        case .ask:
+            // Queue for manual approval
+            let contentPreview: String? = {
+                guard let json = request.params.first,
+                      let data = json.data(using: .utf8),
+                      let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+                return (dict["content"] as? String).map { String($0.prefix(200)) }
+            }()
+
+            let pending = PendingRequest(
+                id: request.id,
+                appName: app.name,
+                appId: app.id,
+                clientPubkey: senderPubkey,
+                method: request.method,
+                kind: kind,
+                contentPreview: contentPreview,
+                rawParams: request.params,
+                receivedAt: .now
+            )
+            requestQueue.enqueue(pending)
+        }
     }
 
     // MARK: - Request Handler Wiring
