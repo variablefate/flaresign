@@ -36,9 +36,10 @@ struct MainTabView: View {
         }
         .sheet(isPresented: Binding(
             get: { appState.requestQueue.currentRequest != nil },
-            set: { if !$0 { appState.requestQueue.deny() } }
+            set: { _ in }  // prevent swipe-dismiss — must use Approve/Deny buttons
         )) {
             ApproveRequestSheet()
+                .interactiveDismissDisabled(true)
         }
     }
 }

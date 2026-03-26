@@ -58,12 +58,15 @@ actor NIP46Service {
                 startNotificationHandler(client: client)
             }
 
-            // Subscribe for Kind 24133 events p-tagged to any of our identities
-            let filter = Filter()
-                .kind(kind: Kind(kind: 24133))
-                .since(timestamp: Timestamp.now())
-            if let client {
-                let _ = try await client.subscribe(filter: filter)
+            // Subscribe for Kind 24133 events p-tagged to each of our identities
+            for pubkeyHex in identityKeys.keys {
+                if let pubkey = try? PublicKey.parse(publicKey: pubkeyHex) {
+                    let filter = Filter()
+                        .kind(kind: Kind(kind: 24133))
+                        .pubkey(pubkey: pubkey)
+                        .since(timestamp: Timestamp.now())
+                    let _ = try? await client?.subscribe(filter: filter)
+                }
             }
 
             logger.info("NIP-46 service started with \(self.identityKeys.count) identities")
@@ -258,22 +261,16 @@ actor NIP46Service {
         let senderPubkey = event.pubkey
         let content = event.content
 
-        // Find which identity this event is addressed to (check p-tags)
-        let recipientPubkey = event.pTags.first ?? identityKeys.keys.first
-        guard let recipientPubkey, identityKeys[recipientPubkey] != nil else {
-            // Try all identities
-            for pubkey in identityKeys.keys {
-                if let request = decryptRequest(content: content, senderPubkey: senderPubkey, recipientIdentityPubkey: pubkey) {
-                    onIncomingRequest?(senderPubkey, pubkey, request)
-                    return
-                }
+        // Find which identity this event is addressed to via p-tag
+        // Only decrypt for identities we own — never brute-force all keys
+        for pTag in event.pTags {
+            guard identityKeys[pTag] != nil else { continue }
+            if let request = decryptRequest(content: content, senderPubkey: senderPubkey, recipientIdentityPubkey: pTag) {
+                onIncomingRequest?(senderPubkey, pTag, request)
+                return
             }
-            return
         }
-
-        if let request = decryptRequest(content: content, senderPubkey: senderPubkey, recipientIdentityPubkey: recipientPubkey) {
-            onIncomingRequest?(senderPubkey, recipientPubkey, request)
-        }
+        // No matching p-tag for our identities — drop silently
     }
 }
 
@@ -294,18 +291,29 @@ final class NIP46NotificationHandler: HandleNotification, @unchecked Sendable {
     func handleMsg(relayUrl: RelayUrl, msg: RelayMessage) async {}
 
     func handle(relayUrl: RelayUrl, subscriptionId: String, event: Event) async {
+        // Only process Kind 24133 (NIP-46)
+        guard event.kind().asU16() == 24133 else { return }
+
         // Extract data from rust-nostr Event into our Sendable struct
         let pubkey = event.author().toHex()
         let content = event.content()
 
         // Extract p-tags
         var pTags: [String] = []
-        if let tags = try? event.tags().toVec() {
-            for tag in tags {
-                if let vec = try? tag.asVec(), vec.count >= 2, vec[0] == "p" {
-                    pTags.append(vec[1])
+        do {
+            let tagVec = try event.tags().toVec()
+            for tag in tagVec {
+                let parts = try tag.asVec()
+                if parts.count >= 2, parts[0] == "p" {
+                    let pHex = parts[1]
+                    // Validate hex pubkey format
+                    if pHex.count == 64, pHex.allSatisfy(\.isHexDigit) {
+                        pTags.append(pHex)
+                    }
                 }
             }
+        } catch {
+            // Tag parsing failed — still process event with empty pTags
         }
 
         let eventData = EventData(pubkey: pubkey, content: content, pTags: pTags)
